@@ -1,4 +1,4 @@
-// ESP32-C3 SoftAP Web Controller + /img endpoint
+// ESP32-C3 SoftAP Web Controller + /img endpoint + Deep Sleep Random Mode (escape via GPIO9)
 // Board: ESP32C3 Dev Module
 
 #include <WiFi.h>
@@ -6,58 +6,89 @@
 #include <Preferences.h>
 #include "doll_img.h"
 
-#define RELAY_PIN 2                 // GPIO number (AITRIP "D2")
-#define DEFAULT_SSID   "ESP32-Button"
-#define DEFAULT_PASS   "press1234"  // 8+ chars
+#define RELAY_PIN        2                 // AITRIP "D2" = GPIO2
+#define WAKE_PIN         9                 // Hold LOW at wake to exit sleep-cycle
+#define WAKE_ACTIVE_LOW  0
 
-#define DEFAULT_MIN_S     5
-#define DEFAULT_MAX_S     15
+#define DEFAULT_SSID   "ESP32-Button"
+#define DEFAULT_PASS   "press1234"
+
+#define DEFAULT_MIN_M     5
+#define DEFAULT_MAX_M     15
 #define DEFAULT_PRESS_MS  200
 
 Preferences prefs;
 WebServer server(80);
 
 struct Settings {
-  bool enabled;
-  uint32_t min_s;
-  uint32_t max_s;
+  bool enabled;           // random mode enabled (persists)
+  uint32_t min_m;         // minutes
+  uint32_t max_m;         // minutes
   uint32_t press_ms;
 } cfg;
 
 enum PressState { IDLE, PRESSING };
 PressState pstate = IDLE;
 
-uint32_t nextTriggerMs = 0;
-uint32_t pressEndMs = 0;
+uint32_t nextTriggerMs = 0;     // only used while Wi-Fi UI is up
+uint32_t pressEndMs   = 0;
 
+bool requestSleep = false;      // set true to enter sleep from loop()
+uint32_t pendingSleepMs = 0;
+
+// ---------- helpers ----------
 void saveSettings() {
   prefs.putBool("enabled",   cfg.enabled);
-  prefs.putUInt("min_s",     cfg.min_s);
-  prefs.putUInt("max_s",     cfg.max_s);
+  prefs.putUInt("min_m",     cfg.min_m);
+  prefs.putUInt("max_m",     cfg.max_m);
   prefs.putUInt("press_ms",  cfg.press_ms);
 }
 
 void loadSettings() {
   cfg.enabled   = prefs.getBool("enabled", false);
-  cfg.min_s     = prefs.getUInt("min_s", DEFAULT_MIN_S);
-  cfg.max_s     = prefs.getUInt("max_s", DEFAULT_MAX_S);
+  cfg.min_m     = prefs.getUInt("min_m", DEFAULT_MIN_M);
+  cfg.max_m     = prefs.getUInt("max_m", DEFAULT_MAX_M);
   cfg.press_ms  = prefs.getUInt("press_ms", DEFAULT_PRESS_MS);
-  if (cfg.min_s < 1) cfg.min_s = 1;
-  if (cfg.max_s < cfg.min_s) cfg.max_s = cfg.min_s;
+  if (cfg.min_m < 1) cfg.min_m = 1;
+  if (cfg.max_m < cfg.min_m) cfg.max_m = cfg.min_m;
 }
 
-// min and max now represent MINUTES, not seconds
+// minutes -> random ms
 uint32_t randMs(uint32_t min_m, uint32_t max_m) {
   uint32_t span = (max_m - min_m + 1);
   uint32_t m = min_m + (esp_random() % span);
-  return m * 60UL * 1000UL;  // minutes → milliseconds
+  return m * 60UL * 1000UL;
 }
 
 inline void relayOn()  { digitalWrite(RELAY_PIN, HIGH); }
 inline void relayOff() { digitalWrite(RELAY_PIN, LOW);  }
-void scheduleNext()    { nextTriggerMs = millis() + randMs(cfg.min_s, cfg.max_s); }
+void scheduleNextUI()  { nextTriggerMs = millis() + randMs(cfg.min_m, cfg.max_m); }
 void startPress(uint32_t ms){ relayOn(); pressEndMs = millis() + ms; pstate = PRESSING; }
 
+// ---------- Deep sleep ----------
+void goToDeepSleep(uint32_t delay_ms) {
+  // prepare wake sources
+  pinMode(WAKE_PIN, INPUT_PULLUP);  // external escape pin (LOW to exit)
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  esp_sleep_enable_timer_wakeup((uint64_t)delay_ms * 1000ULL);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)WAKE_PIN, WAKE_ACTIVE_LOW);
+
+  // turn radios off
+  WiFi.mode(WIFI_OFF);
+  btStop();
+
+  // IMPORTANT: put relay OFF
+  relayOff();
+  delay(5);
+  esp_deep_sleep_start();
+}
+
+bool escapeRequested() {
+  pinMode(WAKE_PIN, INPUT_PULLUP);
+  return digitalRead(WAKE_PIN) == WAKE_ACTIVE_LOW;
+}
+
+// ---------- Web UI (unchanged except minute labels) ----------
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Spooky Village Rocking Horse Doll Controller</title>
@@ -103,7 +134,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </div>
 
 <div class=card>
-  <h3>Random schedule</h3>
+  <h3>Random schedule (deep sleep)</h3>
   <div class=row>
     <div class=grow>
       <label>Min gap (min) <input id=min type=number min=1 max=1440 value=5></label>
@@ -120,6 +151,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <button id="toggle" class=on>Start</button>
     <div class="muted" id="next"></div>
   </div>
+  <div class="muted">To exit while Wi-Fi is off: pull the WAKE pin low (GPIO9) and let it wake.</div>
 </div>
 
 <div class=card>
@@ -128,16 +160,14 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </div>
 
 <script>
+// prevent overwriting while user edits
 const dirty = { press:false, min:false, max:false, dur:false };
-
 function markDirty(id){ dirty[id] = true; }
 function clearDirty(){ for (const k in dirty) dirty[k]=false; }
-
 function setIfIdle(id, val){
-  const el = document.getElementById(id);
-  if (!el) return;
-  if (document.activeElement === el) return;  // user is editing
-  if (dirty[id]) return;                      // user changed but not saved yet
+  const el = document.getElementById(id); if (!el) return;
+  if (document.activeElement === el) return;
+  if (dirty[id]) return;
   if (String(el.value) !== String(val)) el.value = val;
 }
 
@@ -147,15 +177,13 @@ async function fetchStatus(){
     if (!r.ok) throw new Error('HTTP '+r.status);
     const j = await r.json();
 
-    // update inputs ONLY if not focused/dirty
     setIfIdle('press', j.press_ms);
     setIfIdle('min',   j.min_s);
     setIfIdle('max',   j.max_s);
     setIfIdle('dur',   j.press_ms);
 
-    // buttons/status always safe to refresh
     const togg = document.getElementById('toggle');
-    togg.textContent = j.enabled ? 'Stop' : 'Start';
+    togg.textContent = j.enabled ? 'Sleep Cycle: ON' : 'Start';
     togg.className = j.enabled ? 'off' : 'on';
 
     const minsRemaining = j.next_in_ms >= 0 ? Math.round(j.next_in_ms / 60000) : '—';
@@ -169,46 +197,34 @@ async function fetchStatus(){
     document.getElementById('status').textContent = "Lost connection… retrying";
   }
 }
-
-// retry every second regardless of error
 setInterval(fetchStatus, 1000);
 
-// mark inputs dirty when user types; cleared on Save
+// mark inputs dirty
 ['press','min','max','dur'].forEach(id=>{
   const el = document.getElementById(id);
   el.addEventListener('input', ()=>markDirty(id));
   el.addEventListener('change', ()=>markDirty(id));
-  el.addEventListener('keydown', (e)=>{ if(e.key==='Enter') { e.preventDefault(); e.stopPropagation(); }});
+  el.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); }});
 });
 
 function preventReload(ev){ ev.preventDefault(); ev.stopPropagation(); }
-
-document.querySelectorAll('button').forEach(btn=>{
-  btn.addEventListener('click', preventReload);
-});
+document.querySelectorAll('button').forEach(btn=>btn.addEventListener('click', preventReload));
 
 document.getElementById('doPress').onclick = async (e)=>{
-  preventReload(e);
   const ms = +document.getElementById('press').value || 200;
-  await fetch(`/api/press?ms=${ms}`, {cache:'no-store'});
-  // don't clear dirty here — manual press doesn't change stored config
-  fetchStatus();
+  await fetch(`/api/press?ms=${ms}`, {cache:'no-store'}); fetchStatus();
 };
 
 document.getElementById('save').onclick = async (e)=>{
-  preventReload(e);
   const min = +document.getElementById('min').value || 5;
   const max = +document.getElementById('max').value || 15;
   const dur = +document.getElementById('dur').value || 200;
   await fetch(`/api/config?min=${min}&max=${max}&press=${dur}`, {cache:'no-store'});
-  clearDirty();          // server now owns truth; allow UI to refresh inputs
-  fetchStatus();
+  clearDirty(); fetchStatus();
 };
 
 document.getElementById('toggle').onclick = async (e)=>{
-  preventReload(e);
-  await fetch('/api/toggle', {cache:'no-store'});
-  fetchStatus();
+  await fetch('/api/toggle', {cache:'no-store'}); fetchStatus();
 };
 
 fetchStatus();
@@ -216,16 +232,14 @@ fetchStatus();
 </body></html>
 )HTML";
 
-// ---- forward declarations for image data (in a separate .h we include below)
+// image endpoint
 extern const uint8_t DOLL_JPG[] PROGMEM;
 extern const size_t  DOLL_JPG_LEN;
 
-void handleIndex() {
-  server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
-}
-void handleImg() {
-  server.send_P(200, "image/jpeg", (PGM_P)DOLL_JPG, DOLL_JPG_LEN);
-}
+// ---------- HTTP handlers ----------
+void handleIndex() { server.send_P(200, "text/html; charset=utf-8", INDEX_HTML); }
+void handleImg()   { server.send_P(200, "image/jpeg", (PGM_P)DOLL_JPG, DOLL_JPG_LEN); }
+
 void handleStatus() {
   int32_t nextIn = -1;
   if (cfg.enabled && pstate == IDLE) nextIn = (int32_t)(nextTriggerMs - millis());
@@ -236,46 +250,73 @@ void handleStatus() {
   snprintf(buf, sizeof(buf),
     "{\"enabled\":%s,\"min_s\":%u,\"max_s\":%u,\"press_ms\":%u,"
     "\"pressing\":%s,\"next_in_ms\":%d,\"ap_ip\":\"%u.%u.%u.%u\"}",
-    cfg.enabled?"true":"false", cfg.min_s, cfg.max_s, cfg.press_ms,
+    cfg.enabled?"true":"false", cfg.min_m, cfg.max_m, cfg.press_ms,
     (pstate==PRESSING)?"true":"false", nextIn,
     ip[0],ip[1],ip[2],ip[3]);
   server.send(200, "application/json", buf);
 }
+
 void handlePress() {
   uint32_t ms = cfg.press_ms;
   if (server.hasArg("ms")) ms = constrain(server.arg("ms").toInt(), 50, 5000);
-  if (pstate == IDLE) { startPress(ms); scheduleNext(); }
+  if (pstate == IDLE) { startPress(ms); scheduleNextUI(); }
   server.send(200, "text/plain", "OK");
 }
+
 void handleConfig() {
-  if (server.hasArg("min"))
-    cfg.min_s = std::max((uint32_t)1, (uint32_t)server.arg("min").toInt());
-  if (server.hasArg("max"))
-    cfg.max_s = std::max(cfg.min_s, (uint32_t)server.arg("max").toInt());
-  if (server.hasArg("press"))
-    cfg.press_ms = constrain(server.arg("press").toInt(), 50, 5000);
-  saveSettings(); scheduleNext();
+  if (server.hasArg("min"))  cfg.min_m = std::max((uint32_t)1, (uint32_t)server.arg("min").toInt());
+  if (server.hasArg("max"))  cfg.max_m = std::max(cfg.min_m, (uint32_t)server.arg("max").toInt());
+  if (server.hasArg("press")) cfg.press_ms = constrain(server.arg("press").toInt(), 50, 5000);
+  saveSettings(); scheduleNextUI();
   server.send(200, "text/plain", "OK");
 }
+
 void handleToggle() {
   cfg.enabled = !cfg.enabled; saveSettings();
-  if (cfg.enabled) scheduleNext();
+  if (cfg.enabled) {
+    pendingSleepMs = randMs(cfg.min_m, cfg.max_m);
+    requestSleep = true;                 // sleep after we finish this HTTP response
+  }
   server.send(200, "text/plain", cfg.enabled ? "ENABLED" : "DISABLED");
 }
 
+// ---------- setup / loop ----------
 void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   relayOff();
+  pinMode(WAKE_PIN, INPUT_PULLUP);
 
   prefs.begin("btn", false);
   loadSettings();
 
+  // Check wake cause
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
+  if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+    // Woke for scheduled press. If escape pin held LOW, exit sleep cycle.
+    if (escapeRequested()) {
+      cfg.enabled = false; saveSettings();
+    } else {
+      // Do the press immediately, then sleep again with a new random delay.
+      startPress(cfg.press_ms);
+      delay(cfg.press_ms);
+      relayOff();
+
+      if (cfg.enabled) {
+        uint32_t next_ms = randMs(cfg.min_m, cfg.max_m);
+        goToDeepSleep(next_ms);
+      }
+    }
+    // If we reached here, either disabled or escape requested → fall through to normal UI boot.
+  }
+
+  // Normal UI mode (or escape)
   WiFi.mode(WIFI_AP);
   WiFi.softAP(DEFAULT_SSID, DEFAULT_PASS);
   delay(100);
 
   server.on("/", HTTP_GET, handleIndex);
-  server.on("/img", HTTP_GET, handleImg);           // <-- your image
+  server.on("/img", HTTP_GET, handleImg);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/press",  HTTP_GET, handlePress);
   server.on("/api/config", HTTP_GET, handleConfig);
@@ -283,10 +324,11 @@ void setup() {
   server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
   server.begin();
 
+  // seed RNG
   uint32_t seed = analogRead(A0); seed ^= micros();
   esp_fill_random(&seed, sizeof(seed)); srand(seed);
 
-  if (cfg.enabled) scheduleNext();
+  scheduleNextUI();
 }
 
 void loop() {
@@ -296,7 +338,13 @@ void loop() {
   if (pstate == PRESSING && (int32_t)(now - pressEndMs) >= 0) {
     relayOff(); pstate = IDLE;
   }
+  if (cfg.enabled && requestSleep) {
+    // give the client ~200ms to receive the HTTP reply, then sleep
+    delay(200);
+    goToDeepSleep(pendingSleepMs);
+  }
   if (cfg.enabled && pstate == IDLE && (int32_t)(now - nextTriggerMs) >= 0) {
-    startPress(cfg.press_ms); scheduleNext();
+    // If you keep UI mode enabled for testing, still allow an in-UI random press
+    startPress(cfg.press_ms); scheduleNextUI();
   }
 }
