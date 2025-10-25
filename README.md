@@ -1,133 +1,104 @@
-# 🕯️ Spooky Village Rocking Horse Doll Controller
+# Spooky Village Rocking Horse Doll Controller 🕯️🎠
 
-An ESP32-C3–based Wi-Fi–enabled controller for the **spooky rocking horse doll**, capable of simulating button presses manually or at randomized intervals.  
-Designed for standalone use (no external Wi-Fi required) — the device creates its own access point and web control panel.  
-Includes **deep sleep power saving** for long battery life and a **hardware wake/escape pin** to exit sleep mode.
-
----
-
-## ⚙️ Features
-
-- 🧠 **Web Control Panel (SoftAP mode)**  
-  - Hosted locally by the ESP32-C3.  
-  - Accessible at `192.168.4.1` when connected to the AP `ESP32-Button`.  
-  - Manual press control, randomized press configuration, and live status updates.  
-
-- ⏱️ **Random Interval Mode (Deep Sleep)**  
-  - Select random min/max press intervals in minutes.  
-  - ESP32-C3 sleeps between activations, drastically extending battery life.  
-  - Automatically wakes for each press.  
-
-- 🔋 **Low Power Deep Sleep**  
-  - Power consumption drops to tens of µA between activations.  
-  - Perfect for battery operation.
-
-- 🧷 **Hardware Wake / Exit Pin (GPIO9)**  
-  - Pull **GPIO9** to GND to exit deep sleep and return to full Wi-Fi web control mode.  
-
-- 🎭 **On-board Image & Web Styling**  
-  - The included `doll_img.h` serves a spooky doll photo from program memory.  
-  - Optional web customization via HTML/CSS in the sketch.
+This project controls a *rocking horse doll* using an **ESP32-C3** microcontroller and a **Panasonic AQV212 solid-state relay**.  
+It supports both **web-based manual control** and **randomized press activation** intervals, mimicking autonomous doll motion.
 
 ---
 
-## 🪛 Hardware Connections
+## 🧩 Hardware Overview
 
-### Control Side
-| ESP32-C3 Pin | Component | Description |
-|---------------|------------|-------------|
-| GPIO2 | AQV212 pin 1 (+) via 470 Ω resistor | Controls the relay input |
-| GND | AQV212 pin 2 (–) | Relay input ground |
-| GPIO9 | Button to GND | Wake/escape input |
-| 3V3 / VIN | Power | Depending on your power source |
+| Component | Description | Notes |
+|------------|-------------|-------|
+| **ESP32-C3** | Main microcontroller | Wi-Fi capable, deep-sleep support |
+| **Panasonic AQV212** | Solid-state relay (SSR) | Controls the doll’s internal button |
+| **Momentary button** | Wake-up button | Pulls `GPIO4` low to wake device |
+| **Power source** | USB or 5V | Ensure stable supply for relay |
 
-### Load Side (Simulated Button)
-| AQV212 Pins | Function |
-|--------------|-----------|
-| 4 & 5 | Connected across the toy’s existing push-button leads |
+### 🔌 Pin Connections
+
+#### AQV212 (Panasonic Solid-State Relay)
+
+| AQV212 Pin | Function | Connects To | Notes |
+|-------------|-----------|-------------|-------|
+| **1** | Input (+) | ESP32-C3 `GPIO2` through 470Ω resistor | Relay control signal |
+| **2** | Input (−) | GND | Input return |
+| **3** | — | *No connection (NC)* | Leave unconnected |
+| **4** | Output (load terminal 1) | Doll button wire 1 | Controls the button circuit |
+| **5** | Output (load terminal 2) | Doll button wire 2 | Controls the button circuit |
+| **6** | — | *No connection (NC)* | Leave unconnected |
+
+> ✅ According to the Panasonic AQV212 datasheet, **pin 3 is a no-connect**.  
+> Only **pins 4, 5, and 6** are the output terminals that replace the physical button.
+
+### ESP32-C3 GPIO Assignments
+
+| GPIO | Function | Description |
+|------|-----------|-------------|
+| `GPIO2` | Relay output | Drives AQV212 input pin 1 |
+| `GPIO4` | Wake-up button | Wakes ESP32-C3 from deep sleep when pulled LOW |
+| `A0` | Analog noise source | Used to seed RNG (optional) |
 
 ---
 
-## 🔋 Power Notes
+## ⚙️ Software Features
 
-- Typical ESP32-C3 active: ~100 mA  
-- Deep sleep (timer): ~20–30 µA  
-- The included 2000 mAh Li-Po can run **weeks to months** in deep-sleep random mode.  
-
----
-
-## 🧰 File Overview
-
-| File | Description |
-|------|--------------|
-| `Spooky_Doll_Controller.ino` | Main Arduino sketch (webserver + logic + deep sleep) |
-| `doll_img.h` | JPEG image stored in PROGMEM (served at `/img`) |
-
----
-
-## 📷 Serving the Doll Image
-
-The doll image is embedded directly from `doll_img.h`.  
-To replace it:
-
-1. Convert a JPEG to a C header:
-   ```bash
-   xxd -i spooky.jpg > doll_img.h
-   ```
-2. Rename variables inside to:
-   ```c
-   const uint8_t DOLL_JPG[] PROGMEM = { ... };
-   const size_t DOLL_JPG_LEN = sizeof(DOLL_JPG);
-   ```
+- **Local web server UI** (served via AP mode: `ESP32-Button`, pass `press1234`)
+- **Manual button press** trigger from web page
+- **Configurable randomized interval** between activations
+- **Deep-sleep** between triggers for ultra-low power use
+- **Wake pin** (GPIO4) for instant manual override (escape from sleep)
 
 ---
 
 ## 🌐 Web Interface
 
-After flashing:
+Open a browser to `http://192.168.4.1` after connecting to the AP.
 
-1. Connect to Wi-Fi network:  
-   **SSID:** `ESP32-Button`  
-   **Password:** `press1234`
-2. Open a browser and go to **http://192.168.4.1/**
-3. Use the control page to:
-   - Trigger manual presses.
-   - Configure random intervals.
-   - Start/stop random deep-sleep mode.
-4. To exit sleep mode, **hold GPIO9 low (to GND)** and reset or wait for next wake.
+### Pages
+- `/` → Main control dashboard (HTML/JS UI)
+- `/img` → Doll image
+- `/api/status` → JSON status
+- `/api/press` → Manual press
+- `/api/config` → Update timing/press settings
+- `/api/toggle` → Enable/disable randomized mode
 
 ---
 
-## 💡 Deep Sleep Behavior Summary
+## 💤 Deep Sleep Behavior
 
-| Condition | Wi-Fi | Behavior |
-|------------|--------|-----------|
-| Random Mode (active) | OFF | Sleeps for random interval, wakes to press |
-| Wake Pin LOW | OFF | Cancels random mode and reboots to full UI |
-| Manual / Web Control | ON | Normal powered mode with UI active |
+- When **enabled**, ESP32-C3 enters deep sleep for a random time between `min` and `max` minutes.  
+- It wakes automatically via **timer** or manually via **GPIO4 LOW**.
+- On wake:
+  - Performs a simulated button press using AQV212
+  - Returns to deep sleep for the next random interval
 
----
-
-## 🧩 Recommended Parts
-
-- **ESP32-C3 Mini** (AITRIP or Seeed Studio XIAO ESP32C3)  
-- **AQV212 PhotoMOS relay** (or equivalent 3–32 V DC input SSR)  
-- **470 Ω series resistor** on control pin  
-- **100 kΩ pulldown** for stability  
-- **2000 mAh 3.7 V Li-Po** battery  
-- **Momentary pushbutton** (GPIO9 → GND for wake)
+Holding the wake button (GPIO4 → GND) at power-up will **cancel sleep** and start normal Wi-Fi/AP mode.
 
 ---
 
-## ⚠️ Safety Note
+## 🛠️ Building & Flashing
 
-- The AQV212 output is **isolated dry contact** rated for **60 V DC @ 1 A** —  
-  do *not* use directly on mains AC circuits.
-- Use low-voltage circuits only (e.g., toy button triggers, control lines).
+1. Open `spooky_village_rocking_horse_doll_controller.ino` in **Arduino IDE**
+2. Select **ESP32-C3 Dev Module**
+3. Compile & upload
+4. Connect to `ESP32-Button` Wi-Fi network
+5. Browse to `http://192.168.4.1`
 
 ---
 
-## 🧙 Credits
+## 📄 License
 
-Developed for fun (and fright).  
-“**Spooky Village Rocking Horse Doll Controller**” — 2025, by invaliddev403 🎃
+**MIT License**  
+Copyright © 2025
+
+---
+
+## 💡 Notes
+
+- Keep AQV212 output wires **isolated** from ESP32-C3 logic circuits.
+- GPIO4 must be an **RTC IO** pin to function as a wake source (it is on the ESP32-C3).  
+- Tested with **Panasonic AQV212** — other SSRs with similar pinouts should work fine.
+
+---
+
+🕯️ *Built for the Spooky Village installation project — 2025 by invaliddev403.*
