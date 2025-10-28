@@ -8,6 +8,7 @@
 #include <Preferences.h>
 #include "esp_sleep.h"          // deep sleep APIs (GPIO wake in this build)
 #include "doll_img.h"           // contains DOLL_JPG[] + DOLL_JPG_LEN
+#include <Adafruit_NeoPixel.h>
 
 // -------- Pin + Config --------
 #define RELAY_PIN        2        // drives AQV212 via 470R
@@ -18,6 +19,9 @@
 #define DEFAULT_MIN_M     5
 #define DEFAULT_MAX_M     15
 #define DEFAULT_PRESS_MS  200
+
+#define RGB_LED_PIN 23   // <- set to the board’s RGB DIN pin if present
+#define RGB_COUNT   1
 
 Preferences prefs;
 WebServer server(80);
@@ -35,13 +39,23 @@ PressState pstate = IDLE;
 uint32_t nextTriggerMs = 0;
 uint32_t pressEndMs = 0;
 
+Adafruit_NeoPixel rgb(RGB_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
+
 // ---------- Helpers ----------
+
+void initRgbOff() {
+  rgb.begin();
+  rgb.clear();   // all zeros
+  rgb.show();    // latch OFF
+}
+
 void saveSettings() {
   prefs.putBool("enabled", cfg.enabled);
   prefs.putUInt("min_m",   cfg.min_m);
   prefs.putUInt("max_m",   cfg.max_m);
   prefs.putUInt("press_ms",cfg.press_ms);
 }
+
 void loadSettings() {
   cfg.enabled   = prefs.getBool("enabled", false);
   cfg.min_m     = prefs.getUInt("min_m", DEFAULT_MIN_M);
@@ -188,6 +202,11 @@ void setup(){
   relayOff();
   pinMode(WAKE_PIN,INPUT_PULLUP);
 
+  // If using RGB, keep it dark
+  #if (RGB_COUNT > 0)
+    initRgbOff();
+  #endif
+
   prefs.begin("btn",false);
   loadSettings();
 
@@ -207,7 +226,10 @@ void setup(){
     }
 
     // Radios off then sleep
-    WiFi.mode(WIFI_OFF); btStop();
+    WiFi.mode(WIFI_OFF);
+    #if defined(CONFIG_BT_ENABLED) || defined(BLUEDROID_ENABLED) || defined(CONFIG_BT_BLUEDROID_ENABLED)
+      btStop();
+    #endif
     esp_deep_sleep_start();
   }
 
@@ -225,8 +247,8 @@ void setup(){
   server.begin();
 
   // RNG seed
-  uint32_t seed = analogRead(A0); seed ^= micros();
-  esp_fill_random(&seed,sizeof(seed)); srand(seed);
+  // uint32_t seed = analogRead(A0); seed ^= micros();
+  // esp_fill_random(&seed,sizeof(seed)); srand(seed);
 
   if(cfg.enabled) scheduleNext();
 }
