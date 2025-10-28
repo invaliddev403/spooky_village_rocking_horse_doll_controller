@@ -210,17 +210,38 @@ void setup(){
   prefs.begin("btn",false);
   loadSettings();
 
-  // Check wake pin to skip deep sleep (Option B)
-  bool wakeHeld = (digitalRead(WAKE_PIN)==LOW);
+  // --- START FIX: Check wakeup cause ---
+  esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
 
-  if(!wakeHeld && cfg.enabled){
+  // Check if we woke from timer to perform the press
+  if (wakeCause == ESP_SLEEP_WAKEUP_TIMER && cfg.enabled) {
+    // Perform the press action that was scheduled
+    relayOn();
+    delay(cfg.press_ms); // Simple delay is fine here as we are just going back to sleep
+    relayOff();
+    // We will now fall through to the deep sleep logic below
+  }
+
+  // Check if the user is holding the button to *cancel* sleep
+  bool wakeHeld = (digitalRead(WAKE_PIN) == LOW);
+
+  // If we woke up from the GPIO button OR the user is holding it on boot,
+  // skip sleep and start the web server.
+  if (wakeCause == ESP_SLEEP_WAKEUP_GPIO || wakeHeld) {
+    // This will break out of the sleep logic and continue to AP setup
+  } 
+  // --- END FIX ---
+  
+  // (Original logic, slightly modified)
+  // If we are enabled AND we didn't just wake from the GPIO button
+  else if (cfg.enabled) { 
     // Deep sleep random mode: sleep until next random press
-    uint64_t sleepMs = randMs(cfg.min_m,cfg.max_m);
-
+    uint64_t sleepMs = randMs(cfg.min_m, cfg.max_m);
+    
     // Timer wake
-    esp_sleep_enable_timer_wakeup((uint64_t)sleepMs*1000ULL);
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
 
-    // GPIO deep-sleep wake on WAKE_PIN LOW (requires RTC-IO pin; GPIO4 is OK on C3)
+    // GPIO deep-sleep wake on WAKE_PIN LOW
     if (esp_sleep_is_valid_wakeup_gpio((gpio_num_t)WAKE_PIN)) {
       esp_deep_sleep_enable_gpio_wakeup(1ULL << WAKE_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
     }
